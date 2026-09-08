@@ -1,0 +1,53 @@
+name: Parquet CAC 40 Bot Rebalance Cycle
+
+on:
+  # Déclenchement manuel
+  workflow_dispatch:
+  # Déclenchement automatique 20 min après chaque relevé officiel (heures UTC converties depuis Paris)
+  # Heures de relevés Paris : 9h00, 10h00, 11h00, 12h00, 13h00, 14h00, 15h00, 16h00, 17h00, 17h30
+  # +20 min : 9h20, 10h20, 11h20, 12h20, 13h20, 14h20, 15h20, 16h20, 17h20, 17h50 (Lundi au Vendredi)
+  schedule:
+    - cron: '20 7,8,9,10,11,12,13,14,15 * * 1-5'  # UTC (Paris = UTC+2 en heure d'été)
+    - cron: '50 15 * * 1-5'
+
+jobs:
+  run-cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Single Trading Cycle
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ETUDIANT_EMAIL: ${{ secrets.ETUDIANT_EMAIL }}
+          ETUDIANT_PASSWORD: ${{ secrets.ETUDIANT_PASSWORD }}
+          DRY_RUN: ${{ secrets.DRY_RUN || 'true' }}
+          LOOKBACK_PERIOD: ${{ vars.LOOKBACK_PERIOD || '20' }}
+          MAX_STOCK_WEIGHT: ${{ vars.MAX_STOCK_WEIGHT || '0.15' }}
+          MAX_SECTOR_WEIGHT: ${{ vars.MAX_SECTOR_WEIGHT || '0.30' }}
+          MIN_CASH_BUFFER: ${{ vars.MIN_CASH_BUFFER || '0.05' }}
+          STOP_LOSS_THRESHOLD: ${{ vars.STOP_LOSS_THRESHOLD || '0.10' }}
+          REBALANCE_THRESHOLD: ${{ vars.REBALANCE_THRESHOLD || '0.03' }}
+        run: |
+          python -c "from parquet_bot import ParquetCAC40Bot; bot = ParquetCAC40Bot(); bot.run_strategy_cycle()"
+
+      - name: Upload Logs Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-bot-log
+          path: parquet_bot.log
+          retention-days: 7

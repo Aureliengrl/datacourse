@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  parquet-bot:
+    build: .
+    container_name: parquet_cac40_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./parquet_bot.log:/app/parquet_bot.log
