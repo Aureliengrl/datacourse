@@ -74,11 +74,32 @@ class TestParquetBotStrategy(unittest.TestCase):
         ])
 
         orders = self.bot.compute_rebalancing_orders(df_target, df_positions, 100000.0, 50000.0)
-        
+
         # Seul BNP doit être rééquilibré
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["symbole"], "BNP")
         self.assertEqual(orders[0]["sens"], "ACHAT")
+
+    def test_cash_buffer_protection_5_percent(self):
+        """Vérifie que les achats ne dépensent JAMAIS le coussin de 5% de cash (50 000 € sur 1M €)."""
+        # Portefeuille 1 000 000 €, cash = 60 000 €
+        # Seuil 5% = 50 000 € -> Seuls 10 000 € sont dépensables
+        df_target = pd.DataFrame([
+            {"symbole": "LVMH", "target_weight": 0.10, "dernier_cours": 500.0}, # voudrait acheter 100 000 €
+        ])
+        df_positions = pd.DataFrame() # Aucune position actuelle
+
+        orders = self.bot.compute_rebalancing_orders(
+            df_target=df_target,
+            df_positions=df_positions,
+            valeur_totale=1000000.0,
+            solde_cash=60000.0
+        )
+
+        self.assertEqual(len(orders), 1)
+        # Max possible = floor(10 000 / 500) = 20 actions = 10 000 €
+        self.assertEqual(orders[0]["quantite"], 20)
+        self.assertEqual(orders[0]["cout_estime"], 10000.0)
 
 
 if __name__ == "__main__":

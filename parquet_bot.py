@@ -434,6 +434,20 @@ class ParquetCAC40Bot:
                 })
 
         # 2. Ajustements sur les titres de la cible
+        # Calcul du plafond de cash dépensable pour préserver STRICTEMENT les 5% de liquidités
+        seuil_liquidites = valeur_totale * MIN_CASH_BUFFER
+        cash_disponible_apres_ventes = solde_cash
+        # Estimer le cash dégagé par les ventes prévues
+        for o in orders:
+            if o["sens"] == "VENTE" and o["symbole"] in positions_map:
+                cash_disponible_apres_ventes += o["quantite"] * positions_map[o["symbole"]]["dernier_cours"]
+
+        # Budget maximum allouable aux achats
+        budget_achats_restant = max(0.0, cash_disponible_apres_ventes - seuil_liquidites)
+        logger.info(
+            f"🔒 Garantie Liquidités : Seuil minimum = {seuil_liquidites:,.2f} € (5%) | Budget maximum disponible pour les achats = {budget_achats_restant:,.2f} €"
+        )
+
         for _, target_row in df_target.iterrows():
             symbole = target_row["symbole"]
             target_weight = target_row["target_weight"]
@@ -462,15 +476,24 @@ class ParquetCAC40Bot:
             qty_diff = target_qty - current_qty
 
             if qty_diff > 0:
-                # Vérification du cash disponible
-                cout_achat = qty_diff * dernier_cours
-                orders.append({
-                    "symbole": symbole,
-                    "sens": "ACHAT",
-                    "quantite": qty_diff,
-                    "cout_estime": cout_achat,
-                    "raison": f"REBALANCEMENT (+{weight_diff*100:.1f}%)"
-                })
+                # Plafonner l'achat au budget cash restant pour respecter les 5% (50 000 €)
+                max_qty_possible = int(math.floor(budget_achats_restant / dernier_cours))
+                buy_qty = min(qty_diff, max_qty_possible)
+
+                if buy_qty > 0:
+                    cout_achat = buy_qty * dernier_cours
+                    budget_achats_restant -= cout_achat
+                    orders.append({
+                        "symbole": symbole,
+                        "sens": "ACHAT",
+                        "quantite": buy_qty,
+                        "cout_estime": cout_achat,
+                        "raison": f"REBALANCEMENT (+{weight_diff*100:.1f}%)"
+                    })
+                else:
+                    logger.warning(
+                        f"Achat de {symbole} reporté : préservation stricte du coussin de 5% de liquidités ({seuil_liquidites:,.2f} €)."
+                    )
             elif qty_diff < 0:
                 orders.append({
                     "symbole": symbole,
