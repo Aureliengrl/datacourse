@@ -162,7 +162,8 @@ class ParquetCAC40Bot:
             if "actif" in df.columns:
                 df = df[df["actif"] == True]
             if "est_indice" in df.columns:
-                df = df[df["est_indice"] == False]
+                df = df[df["est_indice"] != True]
+            df = df[~df["symbole"].str.startswith("^")]
             return df
         except Exception as e:
             logger.error(f"Erreur lors de la récupération des titres : {e}")
@@ -174,9 +175,9 @@ class ParquetCAC40Bot:
             # Récupérer un nombre suffisant de lignes pour calculer momentum et volatilité
             query = (
                 self.supabase.table("cours")
-                .select("symbole, horodatage, valeur")
+                .select("*")
                 .order("horodatage", desc=True)
-                .limit(2000)
+                .limit(2500)
             )
             res = query.execute()
             df = pd.DataFrame(res.data)
@@ -184,7 +185,13 @@ class ParquetCAC40Bot:
                 logger.warning("Table 'cours' vide.")
                 return pd.DataFrame()
             df["horodatage"] = pd.to_datetime(df["horodatage"])
-            df["valeur"] = pd.to_numeric(df["valeur"], errors="coerce")
+            # Support du nom de colonne 'prix' (ou fallback 'valeur')
+            price_col = "prix" if "prix" in df.columns else ("valeur" if "valeur" in df.columns else None)
+            if price_col:
+                df["valeur"] = pd.to_numeric(df[price_col], errors="coerce")
+            else:
+                logger.error(f"Aucune colonne de prix trouvée dans 'cours' : {df.columns.tolist()}")
+                return pd.DataFrame()
             df = df.sort_values(by=["symbole", "horodatage"], ascending=[True, True])
             return df
         except Exception as e:
@@ -235,12 +242,16 @@ class ParquetCAC40Bot:
             except Exception:
                 return []
 
-    def fetch_mon_rang(self) -> Optional[int]:
-        """Récupère le rang actuel au classement."""
+    def fetch_mon_rang(self) -> Optional[Tuple[int, int]]:
+        """Récupère le rang actuel au classement (rang, effectif)."""
         try:
             res = self.supabase.rpc("mon_rang").execute()
-            if res.data is not None:
-                return int(res.data)
+            if res.data:
+                if isinstance(res.data, list) and len(res.data) > 0:
+                    row = res.data[0]
+                    return int(row.get("rang", 1)), int(row.get("effectif", 1))
+                elif isinstance(res.data, (int, str)):
+                    return int(res.data), 0
         except Exception as e:
             logger.debug(f"RPC mon_rang indisponible : {e}")
         return None
@@ -257,10 +268,15 @@ class ParquetCAC40Bot:
         """
         factors = []
         secteur_map = {}
-        if not df_titres.empty and "symbole" in df_titres.columns and "secteur" in df_titres.columns:
-            secteur_map = dict(zip(df_titres["symbole"], df_titres["secteur"].fillna("Autre")))
+        valid_symbols = set()
+        if not df_titres.empty and "symbole" in df_titres.columns:
+            valid_symbols = set(df_titres["symbole"].dropna().unique())
+            if "secteur" in df_titres.columns:
+                secteur_map = dict(zip(df_titres["symbole"], df_titres["secteur"].fillna("Autre")))
 
         for symbole, group in df_cours.groupby("symbole"):
+            if valid_symbols and symbole not in valid_symbols:
+                continue
             group = group.sort_values(by="horodatage")
             prices = group["valeur"].dropna().values
             if len(prices) < 5:
@@ -506,9 +522,10 @@ class ParquetCAC40Bot:
         logger.info("=" * 60)
 
         # 1. Vérification du classement et des ordres en cours
-        rang = self.fetch_mon_rang()
-        if rang is not None:
-            logger.info(f"🏆 Rang actuel dans la compétition : {rang}")
+        rang_info = self.fetch_mon_rang()
+        if rang_info is not None:
+            rang, effectif = rang_info
+            logger.info(f"🏆 Rang actuel dans la compétition : {rang} / {effectif} étudiants")
 
         ordres_en_attente = self.fetch_ordres_en_attente()
         if ordres_en_attente:
@@ -592,22 +609,24 @@ class ParquetCAC40Bot:
     def get_seconds_until_next_cycle(self) -> int:
         """
         Détermine le temps d'attente optimal jusqu'au prochain point de marché.
-        Tente d'interroger prochain_releve() via RPC, sinon calcule le prochain horaire officiel.
+        Tente d'interroger prochaine_mise_a_jour() ou prochain_releve() via RPC.
         """
-        # 1. Tentative d'interrogation du backend Supabase
-        try:
-            res = self.supabase.rpc("prochain_releve").execute()
-            if res.data:
-                target_dt = pd.to_datetime(res.data)
-                # Ajouter le délai de publication Yahoo Finance (buffer de sécurité)
-                target_dt += timedelta(minutes=DELAY_BUFFER_MINUTES)
-                now = datetime.now(target_dt.tzinfo if target_dt.tzinfo else None)
-                diff = (target_dt - now).total_seconds()
-                if diff > 10:
-                    logger.info(f"Prochain relevé serveur (avec buffer {DELAY_BUFFER_MINUTES}m) : {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (dans {int(diff)}s)")
-                    return int(diff)
-        except Exception as e:
-            logger.debug(f"RPC prochain_releve non disponible : {e}")
+        # 1. Tentative d'interrogation du backend Supabase (prochaine_mise_a_jour ou prochain_releve)
+        for rpc_name in ["prochaine_mise_a_jour", "prochain_releve"]:
+            try:
+                res = self.supabase.rpc(rpc_name).execute()
+                if res.data:
+                    target_dt = pd.to_datetime(res.data)
+                    # Si c'est prochain_releve (qui est l'heure de cotation théorique), on ajoute le buffer
+                    if rpc_name == "prochain_releve":
+                        target_dt += timedelta(minutes=DELAY_BUFFER_MINUTES)
+                    now = datetime.now(target_dt.tzinfo if target_dt.tzinfo else None)
+                    diff = (target_dt - now).total_seconds()
+                    if diff > 5:
+                        logger.info(f"Prochain relevé serveur via RPC '{rpc_name}' : {target_dt.strftime('%Y-%m-%d %H:%M:%S')} (dans {int(diff)}s / {int(diff)//60} min)")
+                        return int(diff)
+            except Exception as e:
+                logger.debug(f"RPC {rpc_name} non disponible : {e}")
 
         # 2. Calcul local basé sur les 10 relevés fixes par jour
         now = datetime.now()
