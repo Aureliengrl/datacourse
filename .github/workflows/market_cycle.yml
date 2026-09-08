@@ -34,7 +34,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           ETUDIANT_EMAIL: ${{ secrets.ETUDIANT_EMAIL }}
           ETUDIANT_PASSWORD: ${{ secrets.ETUDIANT_PASSWORD }}
-          DRY_RUN: ${{ secrets.DRY_RUN || 'true' }}
+          DRY_RUN: ${{ secrets.DRY_RUN }}
           LOOKBACK_PERIOD: ${{ vars.LOOKBACK_PERIOD || '20' }}
           MAX_STOCK_WEIGHT: ${{ vars.MAX_STOCK_WEIGHT || '0.15' }}
           MAX_SECTOR_WEIGHT: ${{ vars.MAX_SECTOR_WEIGHT || '0.30' }}
