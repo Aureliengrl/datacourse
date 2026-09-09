@@ -523,8 +523,9 @@ class ParquetCAC40Bot:
 
         try:
             # Appel de la RPC passer_mon_ordre(p_sens, p_symbole, p_quantite)
+            # La contrainte SQL 'ordres_sens_check' exige des valeurs en minuscules ('achat', 'vente')
             params = {
-                "p_sens": sens.upper(),
+                "p_sens": sens.lower(),
                 "p_symbole": symbole,
                 "p_quantite": int(quantite)
             }
