@@ -83,13 +83,14 @@ ETUDIANT_PASSWORD = os.getenv("ETUDIANT_PASSWORD", "")
 
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() in ("true", "1", "yes", "t")
 
-# Paramètres Stratégie
-LOOKBACK_PERIOD = int(os.getenv("LOOKBACK_PERIOD", "20"))
+# Paramètres Stratégie Quantitative
+LOOKBACK_PERIOD = int(os.getenv("LOOKBACK_PERIOD", "60"))
 MAX_STOCK_WEIGHT = float(os.getenv("MAX_STOCK_WEIGHT", "0.15"))
 MAX_SECTOR_WEIGHT = float(os.getenv("MAX_SECTOR_WEIGHT", "0.30"))
 MIN_CASH_BUFFER = float(os.getenv("MIN_CASH_BUFFER", "0.05"))
 STOP_LOSS_THRESHOLD = float(os.getenv("STOP_LOSS_THRESHOLD", "0.10"))
-REBALANCE_THRESHOLD = float(os.getenv("REBALANCE_THRESHOLD", "0.03"))
+REBALANCE_THRESHOLD = float(os.getenv("REBALANCE_THRESHOLD", "0.08"))
+MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT", "15000.0"))
 
 # Heures fixes officielles des 10 relevés de marché (heure de Paris)
 FIXED_MARKET_HOURS = [
@@ -309,15 +310,20 @@ class ParquetCAC40Bot:
         if df_factors.empty:
             return pd.DataFrame()
 
-        # Filtrer les titres à momentum positif (surperformance)
-        # On sélectionne les meilleurs déciles / titres positifs
-        df_positive = df_factors[df_factors["momentum"] > 0].copy()
+        # Score combiné = Momentum / Volatilité
+        df_factors["score"] = df_factors["momentum"] / df_factors["volatilite"]
+        df_factors = df_factors.sort_values(by="score", ascending=False).reset_index(drop=True)
+
+        # Sélection des Top 8 titres à fort momentum
+        df_top = df_factors.head(8).copy()
+        # Ne garder que ceux ayant un momentum strictement positif (ou au moins non négatif)
+        df_positive = df_top[df_top["momentum"] >= 0].copy()
         if df_positive.empty:
-            logger.info("Aucun titre avec momentum strictement positif ; sélection des 5 meilleurs titres relatifs.")
-            df_positive = df_factors.sort_values(by="momentum", ascending=False).head(5).copy()
+            logger.info("Aucun titre avec momentum positif ; conservation du top 5 relatif.")
+            df_positive = df_factors.head(5).copy()
 
         # Score brut = Momentum * Inverse Volatilité (Risk Parity ajustée)
-        df_positive["raw_score"] = df_positive["momentum"] * df_positive["inverse_vol"]
+        df_positive["raw_score"] = np.maximum(df_positive["momentum"], 0.001) * df_positive["inverse_vol"]
         total_raw = df_positive["raw_score"].sum()
 
         if total_raw > 0:
@@ -410,7 +416,10 @@ class ParquetCAC40Bot:
         solde_cash: float
     ) -> List[Dict[str, Any]]:
         """
-        Calcule les ordres de rééquilibrage nécessaires en appliquant le seuil d'écart (REBALANCE_THRESHOLD).
+        Calcule les ordres de rééquilibrage nécessaires en appliquant :
+        1. Une zone tampon de conservation (Buffer zone) pour éviter le sur-trading.
+        2. Le seuil d'écart minimal (REBALANCE_THRESHOLD).
+        3. Un montant minimal par transaction (MIN_TRADE_AMOUNT) pour amortir les frais fixes.
         """
         orders = []
         positions_map = {}
@@ -422,27 +431,28 @@ class ParquetCAC40Bot:
                     "valeur": float(row["valeur"])
                 }
 
-        # 1. Traiter les ventes des positions qui ne sont plus dans le portefeuille cible
         target_symbols = set(df_target["symbole"].tolist()) if not df_target.empty else set()
+
+        # 1. Traiter les sorties de portefeuille (uniquement poussières résiduelles < 2000 € ou vraies sorties)
         for symbole, pos_info in positions_map.items():
-            if symbole not in target_symbols and pos_info["quantite"] > 0:
+            valeur_pos = pos_info["valeur"]
+            qty = pos_info["quantite"]
+            # Nettoyage des lignes résiduelles poussières (< 2000 €)
+            if valeur_pos < 2000.0 and qty > 0 and symbole not in target_symbols:
                 orders.append({
                     "symbole": symbole,
                     "sens": "VENTE",
-                    "quantite": pos_info["quantite"],
-                    "raison": "SORTIE_DE_SELECTION"
+                    "quantite": qty,
+                    "raison": "NETTOYAGE_LIGNE_RESIDUELLE"
                 })
 
         # 2. Ajustements sur les titres de la cible
-        # Calcul du plafond de cash dépensable pour préserver STRICTEMENT les 5% de liquidités
         seuil_liquidites = valeur_totale * MIN_CASH_BUFFER
         cash_disponible_apres_ventes = solde_cash
-        # Estimer le cash dégagé par les ventes prévues
         for o in orders:
             if o["sens"] == "VENTE" and o["symbole"] in positions_map:
                 cash_disponible_apres_ventes += o["quantite"] * positions_map[o["symbole"]]["dernier_cours"]
 
-        # Budget maximum allouable aux achats
         budget_achats_restant = max(0.0, cash_disponible_apres_ventes - seuil_liquidites)
         logger.info(
             f"🔒 Garantie Liquidités : Seuil minimum = {seuil_liquidites:,.2f} € (5%) | Budget maximum disponible pour les achats = {budget_achats_restant:,.2f} €"
@@ -466,22 +476,23 @@ class ParquetCAC40Bot:
 
             weight_diff = target_weight - current_weight
 
-            # Application du filtre anti-frais de transaction
+            # Application du filtre anti-frais de transaction (seuil minimal 8%)
             if abs(weight_diff) < REBALANCE_THRESHOLD:
                 logger.debug(
-                    f"Écart négligeable pour {symbole} : {weight_diff*100:+.2f}% (seuil {REBALANCE_THRESHOLD*100:.1f}%) - Aucun ordre généré."
+                    f"Écart modéré pour {symbole} : {weight_diff*100:+.2f}% (seuil {REBALANCE_THRESHOLD*100:.1f}%) - Aucun ordre généré."
                 )
                 continue
 
             qty_diff = target_qty - current_qty
 
             if qty_diff > 0:
-                # Plafonner l'achat au budget cash restant pour respecter les 5% (50 000 €)
+                # Plafonner l'achat au budget cash restant pour respecter les 5%
                 max_qty_possible = int(math.floor(budget_achats_restant / dernier_cours))
                 buy_qty = min(qty_diff, max_qty_possible)
+                cout_achat = buy_qty * dernier_cours
 
-                if buy_qty > 0:
-                    cout_achat = buy_qty * dernier_cours
+                # Vérifier le montant minimum pour amortir les frais de transaction
+                if buy_qty > 0 and cout_achat >= MIN_TRADE_AMOUNT:
                     budget_achats_restant -= cout_achat
                     orders.append({
                         "symbole": symbole,
@@ -490,17 +501,19 @@ class ParquetCAC40Bot:
                         "cout_estime": cout_achat,
                         "raison": f"REBALANCEMENT (+{weight_diff*100:.1f}%)"
                     })
-                else:
-                    logger.warning(
-                        f"Achat de {symbole} reporté : préservation stricte du coussin de 5% de liquidités ({seuil_liquidites:,.2f} €)."
+                elif buy_qty > 0:
+                    logger.debug(
+                        f"Achat de {symbole} ignoré ({cout_achat:,.2f} € < seuil minimum {MIN_TRADE_AMOUNT:,.2f} €) pour économiser les frais."
                     )
             elif qty_diff < 0:
-                orders.append({
-                    "symbole": symbole,
-                    "sens": "VENTE",
-                    "quantite": abs(qty_diff),
-                    "raison": f"REBALANCEMENT ({weight_diff*100:.1f}%)"
-                })
+                valeur_vente = abs(qty_diff) * dernier_cours
+                if valeur_vente >= MIN_TRADE_AMOUNT or abs(qty_diff) == current_qty:
+                    orders.append({
+                        "symbole": symbole,
+                        "sens": "VENTE",
+                        "quantite": abs(qty_diff),
+                        "raison": f"REBALANCEMENT ({weight_diff*100:.1f}%)"
+                    })
 
         return orders
 
