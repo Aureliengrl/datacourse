@@ -84,13 +84,13 @@ ETUDIANT_PASSWORD = os.getenv("ETUDIANT_PASSWORD", "")
 DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() in ("true", "1", "yes", "t")
 
 # Paramètres Stratégie Quantitative
-LOOKBACK_PERIOD = int(os.getenv("LOOKBACK_PERIOD", "60"))
+LOOKBACK_PERIOD = int(os.getenv("LOOKBACK_PERIOD", "30"))
 MAX_STOCK_WEIGHT = float(os.getenv("MAX_STOCK_WEIGHT", "0.15"))
 MAX_SECTOR_WEIGHT = float(os.getenv("MAX_SECTOR_WEIGHT", "0.30"))
 MIN_CASH_BUFFER = float(os.getenv("MIN_CASH_BUFFER", "0.05"))
-STOP_LOSS_THRESHOLD = float(os.getenv("STOP_LOSS_THRESHOLD", "0.10"))
-REBALANCE_THRESHOLD = float(os.getenv("REBALANCE_THRESHOLD", "0.08"))
-MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT", "15000.0"))
+STOP_LOSS_THRESHOLD = float(os.getenv("STOP_LOSS_THRESHOLD", "0.05"))
+REBALANCE_THRESHOLD = float(os.getenv("REBALANCE_THRESHOLD", "0.05"))
+MIN_TRADE_AMOUNT = float(os.getenv("MIN_TRADE_AMOUNT", "10000.0"))
 
 # Heures fixes officielles des 10 relevés de marché (heure de Paris)
 FIXED_MARKET_HOURS = [
@@ -314,9 +314,8 @@ class ParquetCAC40Bot:
         df_factors["score"] = df_factors["momentum"] / df_factors["volatilite"]
         df_factors = df_factors.sort_values(by="score", ascending=False).reset_index(drop=True)
 
-        # Sélection des Top 8 titres à fort momentum
-        df_top = df_factors.head(8).copy()
-        # Ne garder que ceux ayant un momentum strictement positif (ou au moins non négatif)
+        # Sélection des Top 6 locomotives du CAC 40 à plus fort momentum
+        df_top = df_factors.head(6).copy()
         df_positive = df_top[df_top["momentum"] >= 0].copy()
         if df_positive.empty:
             logger.info("Aucun titre avec momentum positif ; conservation du top 5 relatif.")
@@ -345,25 +344,30 @@ class ParquetCAC40Bot:
         df = df_alloc.copy()
         max_equity_allocation = 1.0 - MIN_CASH_BUFFER
 
-        # Normaliser pour ne pas dépasser max_equity_allocation
-        df["target_weight"] = df["target_weight"] * max_equity_allocation
+        # Normaliser pour viser l'allocation maximale autorisée (95% actions, 5% cash)
+        if df["target_weight"].sum() > 0:
+            df["target_weight"] = (df["target_weight"] / df["target_weight"].sum()) * max_equity_allocation
 
-        # Itération pour écrêter et redistribuer l'excédent
-        for _ in range(5):
-            # Plafond individuel
+        # Itération pour écrêter à 15% par titre et 30% par secteur tout en maximisant l'exposition
+        for _ in range(10):
+            # Plafond individuel (15% max)
             df["target_weight"] = df["target_weight"].clip(upper=MAX_STOCK_WEIGHT)
 
-            # Plafond sectoriel
+            # Plafond sectoriel (30% max)
             for secteur, group in df.groupby("secteur"):
                 secteur_sum = group["target_weight"].sum()
                 if secteur_sum > MAX_SECTOR_WEIGHT:
                     scale = MAX_SECTOR_WEIGHT / secteur_sum
                     df.loc[df["secteur"] == secteur, "target_weight"] *= scale
 
-            # Renormalisation si en dessous du budget investi
+            # Redistribuer l'espace restant aux titres qui ne sont pas encore au plafond de 15%
             current_total = df["target_weight"].sum()
-            if current_total > max_equity_allocation:
-                df["target_weight"] = df["target_weight"] * (max_equity_allocation / current_total)
+            below_cap = (df["target_weight"] < MAX_STOCK_WEIGHT - 1e-4)
+            if current_total < max_equity_allocation and below_cap.any():
+                remaining_budget = max_equity_allocation - current_total
+                below_cap_sum = df.loc[below_cap, "target_weight"].sum()
+                if below_cap_sum > 0:
+                    df.loc[below_cap, "target_weight"] += remaining_budget * (df.loc[below_cap, "target_weight"] / below_cap_sum)
 
         return df
 
@@ -433,18 +437,24 @@ class ParquetCAC40Bot:
 
         target_symbols = set(df_target["symbole"].tolist()) if not df_target.empty else set()
 
-        # 1. Traiter les sorties de portefeuille (uniquement poussières résiduelles < 2000 € ou vraies sorties)
+        # 1. Traiter les sorties de portefeuille pour les titres non sélectionnés dans la cible
         for symbole, pos_info in positions_map.items():
             valeur_pos = pos_info["valeur"]
             qty = pos_info["quantite"]
-            # Nettoyage des lignes résiduelles poussières (< 2000 €)
-            if valeur_pos < 2000.0 and qty > 0 and symbole not in target_symbols:
-                orders.append({
-                    "symbole": symbole,
-                    "sens": "VENTE",
-                    "quantite": qty,
-                    "raison": "NETTOYAGE_LIGNE_RESIDUELLE"
-                })
+            if qty <= 0:
+                continue
+
+            current_weight = valeur_pos / valeur_totale if valeur_totale > 0 else 0.0
+
+            # Vendre si le titre n'est plus dans la cible et représente soit une poussière, soit une ligne significative à liquider
+            if symbole not in target_symbols:
+                if current_weight >= REBALANCE_THRESHOLD or valeur_pos >= MIN_TRADE_AMOUNT or valeur_pos < 5000.0:
+                    orders.append({
+                        "symbole": symbole,
+                        "sens": "VENTE",
+                        "quantite": qty,
+                        "raison": "ROTATION_SORTIE_CIBLE"
+                    })
 
         # 2. Ajustements sur les titres de la cible
         seuil_liquidites = valeur_totale * MIN_CASH_BUFFER
