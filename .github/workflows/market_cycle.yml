@@ -3,9 +3,11 @@ name: Parquet CAC 40 Bot Rebalance Cycle
 on:
   # Déclenchement manuel
   workflow_dispatch:
-  # Déclenchement automatique 1 fois par jour après la clôture des marchés à 17h50 Paris (15h50 UTC)
-  # Ce rythme journalier évite le sur-trading et préserve le capital des frais de courtage excessifs
+  # Déclenchement automatique :
+  # 1. À 11h25 Paris (09h25 UTC) pour finaliser les achats de la rotation dès que les ventes de 11h20 sont créditées
+  # 2. À 17h50 Paris (15h50 UTC) chaque jour à la clôture officielle
   schedule:
+    - cron: '25 9 * * 1-5'
     - cron: '50 15 * * 1-5'
 
 jobs:
